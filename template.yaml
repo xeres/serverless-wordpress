@@ -1,0 +1,403 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: SAM template for WordPress with AWS Lambda, Aurora Serverless and Amazon EFS
+Transform: AWS::Serverless-2016-10-31
+
+Parameters:
+  LatestAmzn2LinuxImageId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+
+Resources:
+  Function:
+    Type: AWS::Serverless::Function
+    DependsOn:
+      - FSMountTargetAZ1
+      - FSMountTargetAZ2
+    Properties:
+      FunctionName: !Sub ${AWS::StackName}-phpserver
+      CodeUri: src
+      Handler: handler.php
+      MemorySize: 256
+      # HTTP API quotas / Maximum integration timeout: 30 seconds (Can not be increased)
+      # https://docs.aws.amazon.com/apigateway/latest/developerguide/limits.html
+      # XXX: WordPress often reaches this quota, but it's hard to fix.
+      Timeout: 30
+      Tracing: Active
+      Runtime: provided
+      Layers:
+        - !Sub arn:aws:lambda:${AWS::Region}:887080169480:layer:php73:3
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref SecurityGroupFunction
+        SubnetIds:
+          - !Ref SubnetPrivateAZ1
+          - !Ref SubnetPrivateAZ2
+      FileSystemConfigs:
+        - Arn: !GetAtt AccessPoint.Arn
+          # XXX: hard-coded
+          LocalMountPath: /mnt/docroot
+      Events:
+        Root:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: $default
+            Method: ANY
+            # backward compatibility for REST API (API Gateway v1) Lambda integration
+            # https://docs.aws.amazon.com/apigateway/latest/developerguide/http-api-develop-integrations-lambda.html#http-api-develop-integrations-lambda.proxy-format
+            PayloadFormatVersion: '1.0'
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      AccessLogSettings:
+        DestinationArn: !GetAtt LogGroup.Arn
+        # DO NOT INDENT ATTRIBUTES!
+        # SEE ALSO: https://github.com/serverless/serverless/issues/7162#issuecomment-570510828
+        Format: >-
+          {
+          "requestId":"$context.requestId",
+          "ip": "$context.identity.sourceIp",
+          "requestTime":"$context.requestTime",
+          "httpMethod":"$context.httpMethod",
+          "routeKey":"$context.routeKey",
+          "status":"$context.status",
+          "protocol":"$context.protocol",
+          "responseLength":"$context.responseLength",
+          "error.message": "$context.error.message",
+          "integrationErrorMessage", "$context.integrationErrorMessage"
+          }
+
+  SecurityGroupFunction:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Lambda
+      VpcId: !Ref Vpc
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+
+  CloudWatchRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - apigateway.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonAPIGatewayPushToCloudWatchLogs
+
+  Account:
+    Type: AWS::ApiGateway::Account
+    Properties:
+      CloudWatchRoleArn: !GetAtt CloudWatchRole.Arn
+
+  Vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      # XXX: hard-coded
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref Vpc
+      InternetGatewayId: !Ref InternetGateway
+
+  SubnetPublicAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      # XXX: hard-coded
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+
+  SubnetPublicAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      # XXX: hard-coded
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+
+  SubnetPrivateAZ2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      # XXX: hard-coded
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select
+        - 0
+        - !GetAZs ''
+
+  SubnetPrivateAZ1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref Vpc
+      # XXX: hard-coded
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select
+        - 1
+        - !GetAZs ''
+
+  RouteTablePublic:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  RoutePublic:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  RouteTableAssocPublicAZ1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      SubnetId: !Ref SubnetPublicAZ1
+
+  RouteTableAssocPublicAZ2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTablePublic
+      SubnetId: !Ref SubnetPublicAZ2
+
+  EipAZ1:
+    Type: AWS::EC2::EIP
+
+  NatGatewayAZ1:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref SubnetPublicAZ1
+      AllocationId: !GetAtt EipAZ1.AllocationId
+
+  EipAZ2:
+    Type: AWS::EC2::EIP
+
+  NatGatewayAZ2:
+    Type: AWS::EC2::NatGateway
+    Properties:
+      SubnetId: !Ref SubnetPublicAZ2
+      AllocationId: !GetAtt EipAZ2.AllocationId
+
+  RouteTablePrivateAZ1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  RoutePrivateAZ1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTablePrivateAZ1
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayAZ1
+
+  RouteTableAssocPrivateAZ1:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTablePrivateAZ1
+      SubnetId: !Ref SubnetPrivateAZ1
+
+  RouteTablePrivateAZ2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref Vpc
+
+  RoutePrivateAZ2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref RouteTablePrivateAZ2
+      DestinationCidrBlock: 0.0.0.0/0
+      NatGatewayId: !Ref NatGatewayAZ2
+
+  RouteTableAssocPrivateAZ2:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      RouteTableId: !Ref RouteTablePrivateAZ2
+      SubnetId: !Ref SubnetPrivateAZ2
+
+  DBCluster:
+    Type: AWS::RDS::DBCluster
+    Properties:
+      # Now Aurora Serverless has compatibility with MySQL 5.7.
+      # https://aws.amazon.com/about-aws/whats-new/2020/06/announcing-aurora-serverless-with-mysql-5-7-compatibility/
+      Engine: aurora-mysql
+      EngineMode: serverless
+      MasterUsername: !Join ['', ['{{resolve:secretsmanager:', !Ref SecretDB, ':SecretString:username}}' ]]
+      MasterUserPassword: !Join ['', ['{{resolve:secretsmanager:', !Ref SecretDB, ':SecretString:password}}' ]]
+      DBClusterParameterGroupName: !Ref DBClusterParameterGroup
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      DatabaseName: wordpress
+      StorageEncrypted: true
+      VpcSecurityGroupIds:
+        - !Ref SecurityGroupDBCluster
+
+  SecretTargetAttachment:
+    Type: AWS::SecretsManager::SecretTargetAttachment
+    Properties:
+      SecretId: !Ref SecretDB
+      TargetId: !Ref DBCluster
+      TargetType: AWS::RDS::DBCluster
+
+  SecretDB:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: wordpress-database
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"wordpress"}'
+        GenerateStringKey: password
+        # https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/CHAP_Limits.html#RDS_Limits.FileSize.Aurora
+        ExcludeCharacters: '/"@ '
+
+  DBClusterParameterGroup:
+    Type: AWS::RDS::DBClusterParameterGroup
+    Properties:
+      Family: aurora-mysql5.7
+      Description: for Unicode support
+      Parameters:
+        # The following options are not required to use character_set_server=utf8mb4 with MySQL 5.7.
+        # - innodb_file_format
+        # - innodb_default_row_format
+        # - innodb_large_prefix
+        # SEE ALSO: https://dev.to/seizans/mysqlinnodb--charset--utf8mb4--1451
+        character_set_server: utf8mb4
+        # for Sushi-Beer issue
+        # SEE ALSO: https://blog.kamipo.net/entry/2017/06/22/005958
+        collation_server: utf8mb4_bin
+
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: !Ref Vpc
+      SubnetIds:
+        - !Ref SubnetPrivateAZ1
+        - !Ref SubnetPrivateAZ2
+
+  SecurityGroupDBCluster:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Aurora Serverless
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref SecurityGroupFunction
+
+  FileSystem:
+    Type: AWS::EFS::FileSystem
+    Properties:
+      Encrypted: true
+
+  AccessPoint:
+    Type: AWS::EFS::AccessPoint
+    Properties:
+      FileSystemId: !Ref FileSystem
+      PosixUser:
+        # XXX: hard-coded (uid=1000,gid=1000 = ec2-user)
+        Uid: '1000'
+        Gid: '1000'
+      RootDirectory:
+        CreationInfo:
+          OwnerGid: '1000'
+          OwnerUid: '1000'
+          Permissions: '0755'
+          # XXX: hard-coded, but it's not visible from AWS Lambda.
+        Path: /lambda
+
+  FSMountTargetAZ1:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref SubnetPrivateAZ1
+      SecurityGroups:
+        - !Ref SecurityGroupFileSystem
+
+  FSMountTargetAZ2:
+    Type: AWS::EFS::MountTarget
+    Properties:
+      FileSystemId: !Ref FileSystem
+      SubnetId: !Ref SubnetPrivateAZ2
+      SecurityGroups:
+        - !Ref SecurityGroupFileSystem
+
+  SecurityGroupFileSystem:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for EFS
+      VpcId: !Ref Vpc
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 2049
+          ToPort: 2049
+          SourceSecurityGroupId: !Ref SecurityGroupFunction
+
+  Instance:
+    DependsOn:
+      - AccessPoint
+      - FSMountTargetAZ1
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !Ref LatestAmzn2LinuxImageId
+      SubnetId: !Ref SubnetPrivateAZ1
+      InstanceType: t3.nano
+      IamInstanceProfile: !Ref InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -x
+          yum install -y amazon-efs-utils
+          mount -t efs -o tls,accesspoint=${AccessPoint} ${FileSystem} /mnt
+          cd /tmp
+          curl -L https://ja.wordpress.org/latest-ja.zip -o latest-ja.zip
+          unzip -x latest-ja.zip && rm latest-ja.zip
+          cp -r wordpress/* /mnt && rm -rf wordpress/
+          chown -R 1000:1000 /mnt/*
+      SecurityGroupIds:
+        - !Ref SecurityGroupFunction
+  
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          -
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+            Action:
+              - sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+
+Outputs:
+  DBHost:
+    Value: !GetAtt DBCluster.Endpoint.Address
+  HttpApiEndpoint:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com
+  Instance:
+    Value: !Ref Instance
